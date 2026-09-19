@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AntiAPT Hunter v2.1 Telemetry Platform
+AntiAPT Hunter v2.2 Telemetry Platform
 OSINT & Endpoint Incident Response Suite
 """
 
@@ -10,6 +10,7 @@ import time
 import shutil
 import threading
 import subprocess
+import json
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -46,7 +47,7 @@ except ImportError:
 
 TRANSLATIONS = {
     "en": {
-        "title": "AntiAPT Hunter v2.1 Telemetry Platform",
+        "title": "AntiAPT Hunter v2.2 Telemetry Platform",
         "status_idle": "System Status: IDLE / READY",
         "status_monitoring": "System Status: ACTIVE MONITORING",
         "tab_telemetry": "STIX 2.1 Telemetry",
@@ -68,7 +69,7 @@ TRANSLATIONS = {
         "lang_toggle": "🇺🇦 / 🇬🇧 UA"
     },
     "uk": {
-        "title": "Платформа Телеметрії AntiAPT Hunter v2.1",
+        "title": "Платформа Телеметрії AntiAPT Hunter v2.2",
         "status_idle": "Статус системи: ОЧІКУВАННЯ / ГОТОВО",
         "status_monitoring": "Статус системи: АКТИВНИЙ МОНІТОРИНГ",
         "tab_telemetry": "Телеметрія STIX 2.1",
@@ -98,10 +99,39 @@ class ThreatHunterEngine:
     def __init__(self, log_callback=None):
         self.log_callback = log_callback
 
+    def validate_yara_rules(self, rule_path: str) -> bool:
+        """Validates YARA rule syntax prior to executing scans."""
+        if yara_mode == "MODULE":
+            try:
+                yara.compile(filepath=rule_path)
+                return True
+            except Exception as e:
+                if self.log_callback:
+                    self.log_callback(f"[YARA SYNTAX ERROR] {str(e)}")
+                return False
+        elif yara_mode == "CLI":
+            try:
+                cmd = [YARA_EXE_PATH, "-n", rule_path, sys.executable]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                # Exit code 0 or 1 typically indicates valid rule parsing; code 2 indicates syntax errors
+                if result.returncode == 2:
+                    if self.log_callback:
+                        self.log_callback(f"[YARA SYNTAX ERROR] {result.stderr.strip()}")
+                    return False
+                return True
+            except Exception as e:
+                if self.log_callback:
+                    self.log_callback(f"[YARA CLI Validation Error] {str(e)}")
+                return False
+        return False
+
     def scan_file_with_yara(self, rule_path: str, target_path: str) -> str:
-        """Scans a target file using either Python YARA or yara64.exe."""
+        """Scans a target file using either Python YARA or yara64.exe safely."""
         if not os.path.exists(target_path):
             return "Target file does not exist."
+
+        if not self.validate_yara_rules(rule_path):
+            return "Scan aborted due to invalid YARA rule syntax."
 
         if yara_mode == "MODULE":
             try:
@@ -127,6 +157,27 @@ class ThreatHunterEngine:
 
         else:
             return "YARA scanning unavailable."
+
+    def scan_process_memory(self) -> list:
+        """Audits active process memory modules for anomalous path indicators."""
+        anomalies = []
+        if not psutil:
+            return anomalies
+
+        for proc in psutil.process_iter(['pid', 'name', 'exe', 'memory_info']):
+            try:
+                pinfo = proc.info
+                exe_path = pinfo.get('exe')
+                if exe_path and any(term in exe_path.lower() for term in ["temp", "appdata", "public", "downloads"]):
+                    anomalies.append({
+                        "pid": pinfo.get('pid'),
+                        "name": pinfo.get('name'),
+                        "path": exe_path,
+                        "rss": pinfo.get('memory_info').rss if pinfo.get('memory_info') else 0
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return anomalies
 
     def quarantine_file(self, file_path: str, proc_pid: int = None) -> bool:
         """Terminates process if running and isolates target binary into quarantine directory."""
@@ -472,19 +523,34 @@ class AntiAPTHunterGUI(tk.Tk):
             self.engine.quarantine_file(target_path)
 
     def action_scan_memory(self):
-        self.log_message("Sweeping active process memory...")
-        if psutil:
-            count = len(psutil.pids())
-            self.log_message(f"Audited {count} active processes. No unauthorized hooks detected.")
+        self.log_message("Sweeping active process memory modules...")
+        anomalies = self.engine.scan_process_memory()
+        if anomalies:
+            self.log_message(f"[WARNING] Found {len(anomalies)} processes running from non-standard paths.")
+            for item in anomalies:
+                self.threat_table.after(0, lambda path=item['path'], pid=item['pid']: self.threat_table.insert("", tk.END, values=(path, f"Memory Hook (PID {pid})")))
         else:
-            self.log_message("Memory sweep skipped: psutil package missing.")
+            self.log_message("Memory sweep complete. No unauthorized path hooks detected.")
 
     def action_export_stix(self):
         file_path = filedialog.asksaveasfilename(title="Export STIX 2.1 Bundle", defaultextension=".json", filetypes=[("JSON Files", "*.json")])
         if file_path:
-            with open(file_path, "w") as f:
-                f.write('{"type": "bundle", "id": "bundle--antiapt-hunter-telemetry", "objects": []}')
-            self.log_message(f"STIX 2.1 bundle exported to {file_path}")
+            bundle_data = {
+                "type": "bundle",
+                "id": "bundle--antiapt-hunter-telemetry",
+                "objects": [
+                    {
+                        "type": "report",
+                        "spec_version": "2.1",
+                        "id": "report--antiapt-telemetry-run",
+                        "name": "AntiAPT Hunter v2.2 Execution Log",
+                        "published": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    }
+                ]
+            }
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(bundle_data, f, indent=4)
+            self.log_message(f"STIX 2.1 bundle exported successfully to {file_path}")
 
     def action_clear_logs(self):
         self.txt_log.delete("1.0", tk.END)
