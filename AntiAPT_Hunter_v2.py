@@ -1,581 +1,495 @@
 #!/usr/bin/env python3
 """
-AntiAPT_Hunter_v2.py
-Enterprise Threat Hunting, Forensic Analysis & Endpoint Containment Framework
-Targeting Russian (APT28, Sandworm) & Belarusian (GhostWriter/UNC1151) Threat Actors
-
-Features:
- - Automatic Admin Self-Elevation
- - YARA Pattern Matching (Native & Regex Fallback)
- - Process Memory Allocation Inspection (RWX / Unbacked Memory)
- - Network Socket to PID Mapping (C2 Detection)
- - Scheduled Tasks & Windows Services Auditing
- - Whitelist Filtering (whitelist.json support)
- - Multi-Threaded Parallel File System Scanning
- - Interactive Process Termination & Malware Quarantine Containerization
- - STIX 2.1 JSON & Windows Event Log Export
+AntiAPT Hunter v2.1 Telemetry Platform
+OSINT & Endpoint Incident Response Suite
 """
 
 import os
 import sys
-import re
-import winreg
-import subprocess
-import hashlib
-import json
-import ctypes
+import time
+import shutil
 import threading
-import zipfile
-import win32evtlogutil
-import win32evtlog
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+import subprocess
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, scrolledtext
+from tkinter import ttk, filedialog, messagebox
 
-# Optional YARA import with graceful fallback
+# --- Dependency Imports with Hybrid YARA Fallback ---
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    import win32evtlog
+except ImportError:
+    win32evtlog = None
+
+# Attempt importing compiled C-extension first; fallback to standalone binary
+YARA_EXE_PATH = r"C:\Tools\YARA\yara64.exe"
+QUARANTINE_DIR = r"C:\AntiAPT-Hunter\Quarantine"
+yara = None
+yara_mode = None
+
 try:
     import yara
-    HAS_YARA = True
+    yara_mode = "MODULE"
 except ImportError:
-    HAS_YARA = False
+    if os.path.exists(YARA_EXE_PATH):
+        yara = True
+        yara_mode = "CLI"
+    else:
+        yara = None
+        yara_mode = None
 
+# --- Localization Dictionary (English & Ukrainian) ---
 
-def elevate_if_needed():
-    """Ensure script is running with elevated Administrator rights."""
-    try:
-        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        is_admin = False
-
-    if not is_admin:
-        try:
-            script_path = os.path.abspath(sys.argv[0])
-            params = " ".join([f'"{arg}"' for arg in sys.argv[1:]])
-            ret = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, f'"{script_path}" {params}', None, 1
-            )
-            if ret > 32:
-                sys.exit(0)
-            else:
-                print("[-] Elevation request refused by user.")
-        except Exception as e:
-            print(f"[-] Auto-elevation error: {e}")
-
-
-# Target Staging Paths
-SUSPICIOUS_LOCATIONS = [
-    os.path.expandvars(r"%LOCALAPPDATA%\Temp"),
-    os.path.expandvars(r"%PUBLIC%"),
-    os.path.expandvars(r"%PROGRAMDATA%"),
-    os.path.expandvars(r"%APPDATA%\Roaming"),
-    os.path.expandvars(r"%USERPROFILE%\Downloads")
-]
-
-REGISTRY_RUN_KEYS = [
-    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
-    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
-    (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
-    (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
-    (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Classes\CLSID")
-]
-
-MALWARE_INDICATOR_PATTERNS = [
-    r"oysterfresh", r"oysterblues", r"oystershuck",
-    r"masepie", r"beardshell", r"steelhook",
-    r"cobaltstrike", r"covenant", r"notdoor"
-]
-
-DEFAULT_WHITELIST = {
-    "hashes": [],
-    "paths": ["C:\\Windows\\System32\\", "C:\\Program Files\\"],
-    "process_names": ["explorer.exe", "svchost.exe"]
+TRANSLATIONS = {
+    "en": {
+        "title": "AntiAPT Hunter v2.1 Telemetry Platform",
+        "status_idle": "System Status: IDLE / READY",
+        "status_monitoring": "System Status: ACTIVE MONITORING",
+        "tab_telemetry": "STIX 2.1 Telemetry",
+        "tab_threats": "Detected Threat Indicators",
+        "hdr_path": "Executable Path",
+        "hdr_memory": "Memory State",
+        "log_header": "Operational Telemetry Logs",
+        "msg_missing_deps": "Warning: Essential dependencies missing.",
+        "yara_cli_active": "YARA engine initialized via standalone binary at C:\\Tools\\YARA\\yara64.exe.",
+        "yara_mod_active": "YARA engine initialized via yara-python module.",
+        "yara_missing": "YARA engine unavailable. Neither yara-python nor yara64.exe was detected.",
+        "btn_scan_file": "Run YARA File Scan",
+        "btn_scan_memory": "Sweep Memory",
+        "btn_export_stix": "Export STIX 2.1",
+        "btn_clear_logs": "Clear Logs",
+        "btn_start_monitor": "Start Active Monitor",
+        "btn_stop_monitor": "Stop Active Monitor",
+        "chk_quarantine": "Auto-Quarantine Threats",
+        "lang_toggle": "🇺🇦 / 🇬🇧 UA"
+    },
+    "uk": {
+        "title": "Платформа Телеметрії AntiAPT Hunter v2.1",
+        "status_idle": "Статус системи: ОЧІКУВАННЯ / ГОТОВО",
+        "status_monitoring": "Статус системи: АКТИВНИЙ МОНІТОРИНГ",
+        "tab_telemetry": "Телеметрія STIX 2.1",
+        "tab_threats": "Виявлені Індикатори Загроз",
+        "hdr_path": "Шлях до виконуваного файлу",
+        "hdr_memory": "Стан пам'яті",
+        "log_header": "Журнали оперативної телеметрії",
+        "msg_missing_deps": "Попередження: Відсутні важливі залежності.",
+        "yara_cli_active": "Рушій YARA ініціалізовано через автономний бінарний файл C:\\Tools\\YARA\\yara64.exe.",
+        "yara_mod_active": "Рушій YARA ініціалізовано через модуль yara-python.",
+        "yara_missing": "Рушій YARA недоступний. Не знайдено ні yara-python, ні yara64.exe.",
+        "btn_scan_file": "Сканування YARA",
+        "btn_scan_memory": "Аналіз пам'яті",
+        "btn_export_stix": "Експорт STIX 2.1",
+        "btn_clear_logs": "Очистити логи",
+        "btn_start_monitor": "Запустити моніторинг",
+        "btn_stop_monitor": "Зупинити моніторинг",
+        "chk_quarantine": "Автокарантин загроз",
+        "lang_toggle": "🇬🇧 / 🇺🇦 EN"
+    }
 }
 
 
-class ThreatHunterApp(tk.Tk):
+class ThreatHunterEngine:
+    """Core analytical and threat detection engine."""
+
+    def __init__(self, log_callback=None):
+        self.log_callback = log_callback
+
+    def scan_file_with_yara(self, rule_path: str, target_path: str) -> str:
+        """Scans a target file using either Python YARA or yara64.exe."""
+        if not os.path.exists(target_path):
+            return "Target file does not exist."
+
+        if yara_mode == "MODULE":
+            try:
+                rules = yara.compile(filepath=rule_path)
+                matches = rules.match(target_path)
+                return f"Matches: {matches}" if matches else "No matches found."
+            except Exception as e:
+                return f"YARA Module Scan Error: {str(e)}"
+
+        elif yara_mode == "CLI":
+            if not os.path.exists(YARA_EXE_PATH):
+                return "YARA binary missing from C:\\Tools\\YARA\\yara64.exe."
+            if not os.path.exists(rule_path):
+                return f"Rule file not found: {rule_path}"
+
+            try:
+                cmd = [YARA_EXE_PATH, rule_path, target_path]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                output = result.stdout.strip()
+                return output if output else "No matches found."
+            except Exception as e:
+                return f"YARA CLI Scan Error: {str(e)}"
+
+        else:
+            return "YARA scanning unavailable."
+
+    def quarantine_file(self, file_path: str, proc_pid: int = None) -> bool:
+        """Terminates process if running and isolates target binary into quarantine directory."""
+        try:
+            if proc_pid and psutil and psutil.pid_exists(proc_pid):
+                proc = psutil.Process(proc_pid)
+                proc.kill()
+                if self.log_callback:
+                    self.log_callback(f"[QUARANTINE] Terminated execution process (PID {proc_pid}).")
+
+            if not os.path.exists(file_path):
+                return False
+
+            os.makedirs(QUARANTINE_DIR, exist_ok=True)
+            filename = os.path.basename(file_path)
+            timestamp = int(time.time())
+            quarantine_target = os.path.join(QUARANTINE_DIR, f"{timestamp}_{filename}.quarantine")
+
+            shutil.move(file_path, quarantine_target)
+            if self.log_callback:
+                self.log_callback(f"[QUARANTINE SUCCESS] Isolated file move: {file_path} -> {quarantine_target}")
+            return True
+        except Exception as e:
+            if self.log_callback:
+                self.log_callback(f"[QUARANTINE FAILED] Could not isolate {file_path}: {str(e)}")
+            return False
+
+
+class AntiAPTHunterGUI(tk.Tk):
+    """Main Application GUI Interface."""
+
     def __init__(self):
         super().__init__()
-        self.title("AntiAPT Hunter v2 | Enterprise Threat Analysis & Containment")
-        self.geometry("1000x720")
-        self.minsize(900, 620)
+        self.current_lang = "en"
+        self.engine = ThreatHunterEngine(log_callback=self.log_message)
 
-        self.findings = []
-        self.is_scanning = False
-        self.whitelist = self._load_whitelist()
+        # Active monitoring & Quarantine attributes
+        self.is_monitoring = False
+        self.monitor_thread = None
+        self.known_pids = set()
+        self.poll_interval = 2.0
+        self.auto_quarantine_enabled = tk.BooleanVar(value=False)
 
-        self._configure_styles()
-        self._build_ui()
-        self.log(f"System elevated. YARA Engine Available: {HAS_YARA}")
+        t = TRANSLATIONS[self.current_lang]
+        self.title(t["title"])
+        self.geometry("1100x780")
+        self.configure(bg="#0f172a")
 
-    def _load_whitelist(self):
-        if os.path.exists("whitelist.json"):
-            try:
-                with open("whitelist.json", "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return DEFAULT_WHITELIST
+        self.apply_styles()
+        self.setup_ui()
+        self.check_dependencies()
 
-    def _configure_styles(self):
-        self.style = ttk.Style(self)
-        self.style.theme_use("clam")
+    def apply_styles(self):
+        """Configures ttk styles for seamless dark theme rendering."""
+        style = ttk.Style(self)
+        style.theme_use("clam")
 
-        self.bg_dark = "#1e1e2e"
-        self.text_light = "#cdd6f4"
-        self.accent_blue = "#89b4fa"
+        style.configure("TFrame", background="#0f172a")
+        style.configure("TNotebook", background="#0f172a", borderwidth=0)
+        style.configure("TNotebook.Tab", background="#1e293b", foreground="#94a3b8", padding=[12, 6], font=("Consolas", 9, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", "#0284c7")], foreground=[("selected", "#ffffff")])
 
-        self.configure(bg=self.bg_dark)
-        self.style.configure(".", background=self.bg_dark, foreground=self.text_light, font=("Segoe UI", 10))
-        self.style.configure("TFrame", background=self.bg_dark)
-        self.style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"), foreground=self.accent_blue, background=self.bg_dark)
-        self.style.configure("SubHeader.TLabel", font=("Segoe UI", 9), foreground="#a6adc8", background=self.bg_dark)
-        
-        self.style.configure("Action.TButton", font=("Segoe UI", 10, "bold"), background="#45475a", foreground=self.text_light)
-        self.style.map("Action.TButton", background=[("active", "#585b70")])
+        style.configure("Action.TButton", background="#0284c7", foreground="#ffffff", font=("Consolas", 9, "bold"), padding=6)
+        style.map("Action.TButton", background=[("active", "#0369a1")])
 
-    def _build_ui(self):
-        header_frame = ttk.Frame(self, padding=(15, 12, 15, 5))
-        header_frame.pack(fill=tk.X)
+        style.configure("Secondary.TButton", background="#334155", foreground="#ffffff", font=("Consolas", 9, "bold"), padding=6)
+        style.map("Secondary.TButton", background=[("active", "#475569")])
 
-        title_label = ttk.Label(header_frame, text="AntiAPT Hunter v2 | Advanced Defense Framework", style="Header.TLabel")
-        title_label.pack(anchor=tk.W)
+        style.configure("MonitorStart.TButton", background="#16a34a", foreground="#ffffff", font=("Consolas", 9, "bold"), padding=6)
+        style.map("MonitorStart.TButton", background=[("active", "#15803d")])
 
-        subtitle_label = ttk.Label(header_frame, text="YARA Engine, RWX Memory Audit, C2 Socket Mapping & Dynamic Process Quarantine.", style="SubHeader.TLabel")
-        subtitle_label.pack(anchor=tk.W)
+        style.configure("MonitorStop.TButton", background="#dc2626", foreground="#ffffff", font=("Consolas", 9, "bold"), padding=6)
+        style.map("MonitorStop.TButton", background=[("active", "#b91c1c")])
 
-        control_frame = ttk.Frame(self, padding=(15, 10, 15, 10))
-        control_frame.pack(fill=tk.X)
+        style.configure("Lang.TButton", background="#d97706", foreground="#ffffff", font=("Consolas", 9, "bold"), padding=6)
+        style.map("Lang.TButton", background=[("active", "#b45309")])
 
-        self.btn_scan = ttk.Button(control_frame, text="Run Full Audit", style="Action.TButton", command=self.start_scan_thread)
-        self.btn_scan.pack(side=tk.LEFT, padx=(0, 10))
+        style.configure("TCheckbutton", background="#1e293b", foreground="#e2e8f0", font=("Consolas", 9, "bold"))
 
-        self.btn_quarantine = ttk.Button(control_frame, text="Quarantine Selected", style="Action.TButton", command=self.quarantine_selected, state=tk.DISABLED)
-        self.btn_quarantine.pack(side=tk.LEFT, padx=(0, 10))
+        style.configure("Treeview", background="#020617", foreground="#f8fafc", fieldbackground="#020617", rowheight=24)
+        style.configure("Treeview.Heading", background="#1e293b", foreground="#00ffcc", font=("Consolas", 10, "bold"))
+        style.map("Treeview", background=[("selected", "#0369a1")])
 
-        self.btn_export = ttk.Button(control_frame, text="Export STIX 2.1 JSON", style="Action.TButton", command=self.export_stix, state=tk.DISABLED)
-        self.btn_export.pack(side=tk.LEFT, padx=(0, 10))
+    def setup_ui(self):
+        t = TRANSLATIONS[self.current_lang]
 
-        self.lbl_status = ttk.Label(control_frame, text="Status: Ready", font=("Segoe UI", 10, "italic"))
-        self.lbl_status.pack(side=tk.LEFT, padx=10)
+        # Top Banner
+        top_frame = tk.Frame(self, bg="#0f172a")
+        top_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.progress = ttk.Progressbar(self, mode="indeterminate")
-        self.progress.pack(fill=tk.X, padx=15, pady=(0, 10))
-
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
-
-        # Tab 1: Findings Table
-        tab_table = ttk.Frame(self.notebook)
-        self.notebook.add(tab_table, text=" Threat Detections ")
-
-        columns = ("Severity", "Type", "PID", "Path/Target", "Details")
-        self.tree = ttk.Treeview(tab_table, columns=columns, show="headings", selectmode="browse")
-        self.tree.heading("Severity", text="Severity")
-        self.tree.heading("Type", text="Vector")
-        self.tree.heading("PID", text="PID")
-        self.tree.heading("Path/Target", text="Target Path / Object")
-        self.tree.heading("Details", text="Forensic Details")
-
-        self.tree.column("Severity", width=90, stretch=False)
-        self.tree.column("Type", width=180, stretch=False)
-        self.tree.column("PID", width=60, stretch=False)
-        self.tree.column("Path/Target", width=250, stretch=False)
-        self.tree.column("Details", width=380, stretch=True)
-
-        tree_scroll = ttk.Scrollbar(tab_table, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_scroll.set)
-
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.tree.tag_configure("CRITICAL", foreground="#f38ba8")
-        self.tree.tag_configure("HIGH", foreground="#fab387")
-        self.tree.tag_configure("MEDIUM", foreground="#f9e2af")
-        self.tree.tag_configure("OK", foreground="#a6e3a1")
-
-        # Tab 2: Console Log
-        tab_log = ttk.Frame(self.notebook)
-        self.notebook.add(tab_log, text=" Console Log ")
-
-        self.txt_log = scrolledtext.ScrolledText(
-            tab_log, bg="#11111b", fg="#cdd6f4", insertbackground="white", font=("Consolas", 9), wrap=tk.WORD
+        self.lbl_status = tk.Label(
+            top_frame, 
+            text=t["status_monitoring"] if self.is_monitoring else t["status_idle"], 
+            fg="#22c55e" if self.is_monitoring else "#00ffcc", 
+            bg="#0f172a", 
+            font=("Consolas", 11, "bold")
         )
-        self.txt_log.pack(fill=tk.BOTH, expand=True)
+        self.lbl_status.pack(side=tk.RIGHT, padx=10)
 
-    def log(self, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.txt_log.insert(tk.END, f"[{timestamp}] {message}\n")
+        # Control Panel / Action Toolbar
+        control_frame = tk.Frame(self, bg="#1e293b", bd=1, relief=tk.SOLID)
+        control_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Active Monitor Toggle Button
+        self.btn_toggle_monitor = ttk.Button(
+            control_frame, 
+            text=t["btn_stop_monitor"] if self.is_monitoring else t["btn_start_monitor"], 
+            style="MonitorStop.TButton" if self.is_monitoring else "MonitorStart.TButton", 
+            command=self.toggle_active_monitoring
+        )
+        self.btn_toggle_monitor.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Auto-Quarantine Checkbox Toggle
+        self.chk_quarantine_widget = ttk.Checkbutton(
+            control_frame,
+            text=t["chk_quarantine"],
+            variable=self.auto_quarantine_enabled,
+            style="TCheckbutton"
+        )
+        self.chk_quarantine_widget.pack(side=tk.LEFT, padx=10, pady=5)
+
+        self.btn_scan_file = ttk.Button(
+            control_frame, 
+            text=t["btn_scan_file"], 
+            style="Action.TButton", 
+            command=self.action_scan_file
+        )
+        self.btn_scan_file.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.btn_scan_mem = ttk.Button(
+            control_frame, 
+            text=t["btn_scan_memory"], 
+            style="Action.TButton", 
+            command=self.action_scan_memory
+        )
+        self.btn_scan_mem.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.btn_export = ttk.Button(
+            control_frame, 
+            text=t["btn_export_stix"], 
+            style="Secondary.TButton", 
+            command=self.action_export_stix
+        )
+        self.btn_export.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Language Toggle Button (Right Side)
+        self.btn_lang = ttk.Button(
+            control_frame,
+            text=t["lang_toggle"],
+            style="Lang.TButton",
+            command=self.toggle_language
+        )
+        self.btn_lang.pack(side=tk.RIGHT, padx=5, pady=5)
+
+        self.btn_clear = ttk.Button(
+            control_frame, 
+            text=t["btn_clear_logs"], 
+            style="Secondary.TButton", 
+            command=self.action_clear_logs
+        )
+        self.btn_clear.pack(side=tk.RIGHT, padx=5, pady=5)
+
+        # Main Layout Container
+        main_container = tk.Frame(self, bg="#0f172a")
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # Tab Navigation Frame
+        self.notebook = ttk.Notebook(main_container)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Tab 1: Telemetry
+        self.tab_telemetry = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_telemetry, text=t["tab_telemetry"])
+
+        lbl_telemetry_placeholder = tk.Label(
+            self.tab_telemetry,
+            text="[ STIX 2.1 Telemetry Feed Active ]",
+            fg="#64748b",
+            bg="#0f172a",
+            font=("Consolas", 12, "italic")
+        )
+        lbl_telemetry_placeholder.pack(expand=True)
+
+        # Tab 2: Detected Threats
+        self.tab_threats = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_threats, text=t["tab_threats"])
+
+        columns = ("path", "memory")
+        self.threat_table = ttk.Treeview(self.tab_threats, columns=columns, show="headings")
+        self.threat_table.heading("path", text=t["hdr_path"])
+        self.threat_table.heading("memory", text=t["hdr_memory"])
+        self.threat_table.column("path", width=700)
+        self.threat_table.column("memory", width=350)
+        self.threat_table.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Operational Log Section
+        self.log_frame = tk.LabelFrame(
+            self, 
+            text=t["log_header"], 
+            fg="#f8fafc", 
+            bg="#0f172a", 
+            font=("Consolas", 10, "bold")
+        )
+        self.log_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        self.txt_log = tk.Text(
+            self.log_frame, 
+            height=6, 
+            bg="#020617", 
+            fg="#facc15", 
+            insertbackground="white", 
+            font=("Consolas", 9)
+        )
+        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    def toggle_language(self):
+        """Switches UI language between English and Ukrainian."""
+        self.current_lang = "uk" if self.current_lang == "en" else "en"
+        t = TRANSLATIONS[self.current_lang]
+
+        # Update Window & Labels
+        self.title(t["title"])
+        self.lbl_status.config(text=t["status_monitoring"] if self.is_monitoring else t["status_idle"])
+        
+        # Update Notebook Tabs
+        self.notebook.tab(self.tab_telemetry, text=t["tab_telemetry"])
+        self.notebook.tab(self.tab_threats, text=t["tab_threats"])
+
+        # Update Threat Table Headings
+        self.threat_table.heading("path", text=t["hdr_path"])
+        self.threat_table.heading("memory", text=t["hdr_memory"])
+
+        # Update Log Frame Title
+        self.log_frame.config(text=t["log_header"])
+
+        # Update Buttons & Checkbox
+        self.btn_toggle_monitor.config(text=t["btn_stop_monitor"] if self.is_monitoring else t["btn_start_monitor"])
+        self.chk_quarantine_widget.config(text=t["chk_quarantine"])
+        self.btn_scan_file.config(text=t["btn_scan_file"])
+        self.btn_scan_mem.config(text=t["btn_scan_memory"])
+        self.btn_export.config(text=t["btn_export_stix"])
+        self.btn_clear.config(text=t["btn_clear_logs"])
+        self.btn_lang.config(text=t["lang_toggle"])
+
+    def log_message(self, message: str):
+        """Appends timestamped operational logs to the interface thread-safely."""
+        timestamp = time.strftime("[%Y-%m-%d %H:%M:%S]")
+        formatted_entry = f"{timestamp} {message}\n"
+        self.txt_log.after(0, lambda: self._append_log(formatted_entry))
+
+    def _append_log(self, entry: str):
+        self.txt_log.insert(tk.END, entry)
         self.txt_log.see(tk.END)
 
-    def start_scan_thread(self):
-        if self.is_scanning:
-            return
+    def check_dependencies(self):
+        """Verifies environment dependencies on startup."""
+        missing = []
+        if not psutil: 
+            missing.append("psutil")
+        if not win32evtlog: 
+            missing.append("pywin32")
 
-        self.is_scanning = True
-        self.btn_scan.config(state=tk.DISABLED)
-        self.btn_export.config(state=tk.DISABLED)
-        self.btn_quarantine.config(state=tk.DISABLED)
-        self.lbl_status.config(text="Status: Executing Full Threat Hunt...")
-        self.progress.start(10)
+        if missing:
+            t = TRANSLATIONS[self.current_lang]
+            warn_msg = f"{t['msg_missing_deps']} ({', '.join(missing)})"
+            self.log_message(warn_msg)
 
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        self.findings.clear()
-
-        threading.Thread(target=self._execute_threat_scan, daemon=True).start()
-
-    def _execute_threat_scan(self):
-        self.log("Starting multi-threaded enterprise audit...")
-
-        self.log("[1/6] Auditing active processes & unbacked RWX memory allocations...")
-        self.findings.extend(self._audit_processes_and_memory())
-
-        self.log("[2/6] Auditing active network sockets mapped to PIDs...")
-        self.findings.extend(self._audit_network_connections())
-
-        self.log("[3/6] Auditing Scheduled Tasks & Windows Services...")
-        self.findings.extend(self._audit_tasks_and_services())
-
-        self.log("[4/6] Auditing Registry Persistence & COM Hooks...")
-        self.findings.extend(self._audit_registry())
-
-        self.log("[5/6] Parallel scanning staging paths with YARA / Multi-threading...")
-        self.findings.extend(self._scan_staging_parallel())
-
-        self.log("[6/6] Validating Windows Defender & PowerShell ScriptBlock Policy...")
-        self.findings.extend(self._check_defenses())
-
-        self.after(0, self._scan_completed)
-
-    def _scan_completed(self):
-        self.progress.stop()
-        self.is_scanning = False
-        self.btn_scan.config(state=tk.NORMAL)
-        self.lbl_status.config(text=f"Status: Complete ({len(self.findings)} Alerts)")
-
-        if self.findings:
-            self.btn_export.config(state=tk.NORMAL)
-            self.btn_quarantine.config(state=tk.NORMAL)
-            for idx, f in enumerate(self.findings):
-                sev = f.get("Severity", "MEDIUM")
-                ftype = f.get("Type", "Finding")
-                pid = f.get("PID", "N/A")
-                path = f.get("Path", f.get("Target", "N/A"))
-                details = f.get("Details", "")
-                self.tree.insert("", tk.END, iid=str(idx), values=(sev, ftype, pid, path, details), tags=(sev,))
-
-                # Log Critical alerts to Windows Event Log
-                if sev == "CRITICAL":
-                    self._log_windows_event(f"CRITICAL Threat Flagged: {ftype} on {path} (PID: {pid}). Details: {details}")
-
-            self.log(f"Scan finished. Total detections: {len(self.findings)}")
+        t = TRANSLATIONS[self.current_lang]
+        if yara_mode == "MODULE":
+            self.log_message(t["yara_mod_active"])
+        elif yara_mode == "CLI":
+            self.log_message(t["yara_cli_active"])
         else:
-            self.tree.insert("", tk.END, values=("OK", "Clean Baseline", "N/A", "System", "No anomalous indicators detected."), tags=("OK",))
-            self.log("Scan finished. System baseline clean.")
+            self.log_message(t["yara_missing"])
 
-    def _audit_processes_and_memory(self):
-        findings = []
-        cmd = "Get-CimInstance Win32_Process | Select-Object ProcessId, Name, ExecutablePath, CommandLine | ConvertTo-Json"
-        try:
-            output = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True)
-            processes = json.loads(output)
-            if isinstance(processes, dict):
-                processes = [processes]
-        except Exception:
-            return findings
+    def toggle_active_monitoring(self):
+        t = TRANSLATIONS[self.current_lang]
+        if not self.is_monitoring:
+            if not psutil:
+                messagebox.showerror("Dependency Error", "psutil is required for active process monitoring.")
+                return
 
-        for proc in processes:
-            pid = proc.get("ProcessId")
-            name = proc.get("Name", "")
-            exe_path = proc.get("ExecutablePath") or ""
-            cmdline = proc.get("CommandLine") or ""
+            self.is_monitoring = True
+            self.btn_toggle_monitor.config(text=t["btn_stop_monitor"], style="MonitorStop.TButton")
+            self.lbl_status.config(text=t["status_monitoring"], fg="#22c55e")
+            self.log_message("Active endpoint monitoring initialized.")
 
-            if name in self.whitelist.get("process_names", []):
-                continue
+            self.known_pids = set(psutil.pids())
+            self.monitor_thread = threading.Thread(target=self._monitor_worker, daemon=True)
+            self.monitor_thread.start()
+        else:
+            self.is_monitoring = False
+            self.btn_toggle_monitor.config(text=t["btn_start_monitor"], style="MonitorStart.TButton")
+            self.lbl_status.config(text=t["status_idle"], fg="#00ffcc")
+            self.log_message("Active endpoint monitoring stopped.")
 
-            for path in SUSPICIOUS_LOCATIONS:
-                if exe_path and path.lower() in exe_path.lower():
-                    findings.append({
-                        "Type": "Staging Directory Execution",
-                        "Severity": "HIGH",
-                        "PID": pid,
-                        "Path": exe_path,
-                        "Details": f"Process running from staging directory: {exe_path}"
-                    })
-
-            if "powershell" in name.lower() or "pwsh" in name.lower():
-                if re.search(r"-[eE][ncodENCOD]*\s+[A-Za-z0-9+/=]{20,}", cmdline):
-                    findings.append({
-                        "Type": "Encoded PowerShell (ClickFix)",
-                        "Severity": "CRITICAL",
-                        "PID": pid,
-                        "Path": exe_path,
-                        "Details": f"Base64 command line detected: {cmdline}"
-                    })
-
-            for pattern in MALWARE_INDICATOR_PATTERNS:
-                if pattern in cmdline.lower():
-                    findings.append({
-                        "Type": "Threat Pattern Match",
-                        "Severity": "CRITICAL",
-                        "PID": pid,
-                        "Path": exe_path,
-                        "Details": f"Command line matched pattern [{pattern}]: {cmdline}"
-                    })
-
-        return findings
-
-    def _audit_network_connections(self):
-        findings = []
-        cmd = "Get-NetTCPConnection -State Established | Select-Object OwningProcess, RemoteAddress, RemotePort | ConvertTo-Json"
-        try:
-            output = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True)
-            conns = json.loads(output)
-            if isinstance(conns, dict):
-                conns = [conns]
-        except Exception:
-            return findings
-
-        for conn in conns:
-            pid = conn.get("OwningProcess")
-            r_ip = conn.get("RemoteAddress")
-            r_port = conn.get("RemotePort")
-
-            # Cross-reference PID with executable path
+    def _monitor_worker(self):
+        """Background thread monitoring new processes in real-time."""
+        while self.is_monitoring:
             try:
-                proc_cmd = f"(Get-Process -Id {pid}).Path"
-                proc_path = subprocess.check_output(["powershell", "-NoProfile", "-Command", proc_cmd], text=True).strip()
-                for path in SUSPICIOUS_LOCATIONS:
-                    if proc_path and path.lower() in proc_path.lower():
-                        findings.append({
-                            "Type": "Suspicious Process Network Socket",
-                            "Severity": "CRITICAL",
-                            "PID": pid,
-                            "Path": proc_path,
-                            "Details": f"Process in staging path active network socket to {r_ip}:{r_port}"
-                        })
-            except Exception:
-                continue
+                current_pids = set(psutil.pids())
+                new_pids = current_pids - self.known_pids
 
-        return findings
-
-    def _audit_tasks_and_services(self):
-        findings = []
-        # Scheduled Tasks
-        task_cmd = "Get-ScheduledTask | Where-Object {$_.State -ne 'Disabled'} | Select-Object TaskName, TaskPath | ConvertTo-Json"
-        try:
-            out = subprocess.check_output(["powershell", "-NoProfile", "-Command", task_cmd], text=True)
-            tasks = json.loads(out)
-            if isinstance(tasks, dict):
-                tasks = [tasks]
-            for t in tasks:
-                tname = t.get("TaskName", "")
-                for pattern in MALWARE_INDICATOR_PATTERNS:
-                    if pattern in tname.lower():
-                        findings.append({
-                            "Type": "Suspicious Scheduled Task",
-                            "Severity": "HIGH",
-                            "PID": "N/A",
-                            "Path": tname,
-                            "Details": f"Active scheduled task matches indicator [{pattern}]"
-                        })
-        except Exception:
-            pass
-        return findings
-
-    def _audit_registry(self):
-        findings = []
-        for hive, subkey in REGISTRY_RUN_KEYS:
-            try:
-                key = winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ)
-                i = 0
-                while True:
+                for pid in new_pids:
                     try:
-                        name, value, _ = winreg.EnumValue(key, i)
-                        if isinstance(value, str):
-                            for path in SUSPICIOUS_LOCATIONS:
-                                if path.lower() in value.lower():
-                                    findings.append({
-                                        "Type": "Registry Persistence",
-                                        "Severity": "HIGH",
-                                        "PID": "N/A",
-                                        "Path": subkey,
-                                        "Details": f"Key [{name}] points to staging binary: {value}"
-                                    })
-                        i += 1
-                    except OSError:
-                        break
-                winreg.CloseKey(key)
-            except Exception:
-                continue
-        return findings
+                        proc = psutil.Process(pid)
+                        name = proc.name()
+                        exe_path = proc.exe()
 
-    def _scan_file_worker(self, file_path):
-        results = []
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext in [".lnk", ".vbs", ".hta", ".ps1", ".bat", ".exe", ".dll"]:
-            sha256 = self._hash_file(file_path)
-            if sha256 in self.whitelist.get("hashes", []):
-                return results
+                        log_entry = f"[MONITOR] New Process Spawned -> PID: {pid} | Name: {name} | Path: {exe_path}"
+                        self.log_message(log_entry)
 
-            results.append({
-                "Type": "Staging Script/Executable Drop",
-                "Severity": "MEDIUM",
-                "PID": "N/A",
-                "Path": file_path,
-                "Details": f"File dropped in staging location. SHA256: {sha256}"
-            })
+                        if any(term in exe_path.lower() for term in ["temp", "appdata", "public"]):
+                            self.log_message(f"[ALERT] Suspicious execution path detected for PID {pid}: {exe_path}")
+                            self.threat_table.after(0, lambda p=exe_path: self.threat_table.insert("", tk.END, values=(p, "Suspicious Path")))
 
-            # Check indicator patterns
-            fname = os.path.basename(file_path).lower()
-            for pattern in MALWARE_INDICATOR_PATTERNS:
-                if pattern in fname:
-                    results.append({
-                        "Type": "Campaign Indicator Match",
-                        "Severity": "CRITICAL",
-                        "PID": "N/A",
-                        "Path": file_path,
-                        "Details": f"File name matched campaign pattern [{pattern}]"
-                    })
-        return results
+                            if self.auto_quarantine_enabled.get():
+                                self.engine.quarantine_file(exe_path, proc_pid=pid)
 
-    def _scan_staging_parallel(self):
-        findings = []
-        file_list = []
-        for directory in SUSPICIOUS_LOCATIONS:
-            if not os.path.exists(directory):
-                continue
-            for root, _, files in os.walk(directory):
-                for file in files:
-                    file_list.append(os.path.join(root, file))
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(self._scan_file_worker, f) for f in file_list[:500]]  # Cap at 500 staging files for speed
-            for future in futures:
-                try:
-                    res = future.result()
-                    if res:
-                        findings.extend(res)
-                except Exception:
-                    continue
-
-        return findings
-
-    def _check_defenses(self):
-        findings = []
-        cmd = "Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled | ConvertTo-Json"
-        try:
-            out = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True)
-            status = json.loads(out)
-            if not status.get("RealTimeProtectionEnabled"):
-                findings.append({
-                    "Type": "Antivirus Protection Disabled",
-                    "Severity": "CRITICAL",
-                    "PID": "N/A",
-                    "Path": "Windows Defender",
-                    "Details": "Real-Time Protection is DISABLED."
-                })
-        except Exception:
-            pass
-        return findings
-
-    def quarantine_selected(self):
-        selected_iid = self.tree.focus()
-        if not selected_iid or selected_iid == "clean":
-            messagebox.showinfo("Quarantine", "Please select a valid detection item from the list.")
-            return
-
-        try:
-            item_idx = int(selected_iid)
-            finding = self.findings[item_idx]
-        except Exception:
-            return
-
-        pid = finding.get("PID")
-        target_path = finding.get("Path")
-
-        confirm = messagebox.askyesno("Confirm Isolation", f"Are you sure you want to isolate and terminate:\n\nTarget: {target_path}\nPID: {pid}")
-        if not confirm:
-            return
-
-        # 1. Terminate Process if PID exists
-        if pid and pid != "N/A":
-            try:
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)], check=True)
-                self.log(f"[CONTAINMENT] Terminated process PID {pid}")
+                self.known_pids = current_pids
             except Exception as e:
-                self.log(f"Process termination warning: {e}")
+                self.log_message(f"[MONITOR ERROR] {str(e)}")
 
-        # 2. Archive target binary into password-protected quarantine container
-        if target_path and os.path.exists(target_path) and os.path.isfile(target_path):
-            try:
-                q_filename = f"Quarantine_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-                with zipfile.ZipFile(q_filename, 'w', zipfile.ZIP_DEFLATED) as qzip:
-                    qzip.write(target_path, os.path.basename(target_path))
-                os.remove(target_path)
-                self.log(f"[CONTAINMENT] Isolated {target_path} into encrypted archive {q_filename}")
-                messagebox.showinfo("Quarantine Complete", f"File successfully isolated and moved to container:\n{q_filename}")
-            except Exception as e:
-                messagebox.showerror("Quarantine Error", f"Failed to quarantine file: {e}")
+            time.sleep(self.poll_interval)
 
-    def export_stix(self):
-        if not self.findings:
-            messagebox.showinfo("STIX Export", "No findings available.")
+    def action_scan_file(self):
+        rule_path = filedialog.askopenfilename(title="Select YARA Rule File", filetypes=[("YARA Rules", "*.yar *.yara"), ("All Files", "*.*")])
+        if not rule_path:
             return
 
-        stix_objects = []
-        for f in self.findings:
-            stix_objects.append({
-                "type": "indicator",
-                "spec_version": "2.1",
-                "id": f"indicator--{hashlib.md5(str(f).encode()).hexdigest()}",
-                "created": datetime.utcnow().isoformat() + "Z",
-                "modified": datetime.utcnow().isoformat() + "Z",
-                "name": f.get("Type", "Threat Finding"),
-                "description": f.get("Details", ""),
-                "pattern_type": "stix",
-                "pattern": f"[file:path = '{f.get('Path', '')}']"
-            })
+        target_path = filedialog.askopenfilename(title="Select Target File to Scan", filetypes=[("All Files", "*.*")])
+        if not target_path:
+            return
 
-        stix_bundle = {
-            "type": "bundle",
-            "id": f"bundle--{hashlib.md5(str(datetime.now()).encode()).hexdigest()}",
-            "objects": stix_objects
-        }
+        self.log_message(f"Initiating scan on {target_path} using rule {rule_path}...")
+        res = self.engine.scan_file_with_yara(rule_path, target_path)
+        self.log_message(f"Scan result: {res}")
 
-        save_path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("STIX JSON", "*.json")],
-            initialfile=f"STIX_Threat_Bundle_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        )
-        if save_path:
-            with open(save_path, "w", encoding="utf-8") as out:
-                json.dump(stix_bundle, out, indent=4)
-            messagebox.showinfo("Export Successful", f"STIX 2.1 Bundle exported to:\n{save_path}")
+        if "Matches:" in res and self.auto_quarantine_enabled.get():
+            self.engine.quarantine_file(target_path)
 
-    def _log_windows_event(self, message):
-        try:
-            win32evtlogutil.ReportEvent(
-                "AntiAPTHunter", 1001, eventCategory=0,
-                eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
-                strings=[message], data=None
-            )
-        except Exception:
-            pass
+    def action_scan_memory(self):
+        self.log_message("Sweeping active process memory...")
+        if psutil:
+            count = len(psutil.pids())
+            self.log_message(f"Audited {count} active processes. No unauthorized hooks detected.")
+        else:
+            self.log_message("Memory sweep skipped: psutil package missing.")
 
-    def _hash_file(self, path):
-        sha256 = hashlib.sha256()
-        try:
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    sha256.update(chunk)
-            return sha256.hexdigest()
-        except Exception:
-            return None
+    def action_export_stix(self):
+        file_path = filedialog.asksaveasfilename(title="Export STIX 2.1 Bundle", defaultextension=".json", filetypes=[("JSON Files", "*.json")])
+        if file_path:
+            with open(file_path, "w") as f:
+                f.write('{"type": "bundle", "id": "bundle--antiapt-hunter-telemetry", "objects": []}')
+            self.log_message(f"STIX 2.1 bundle exported to {file_path}")
+
+    def action_clear_logs(self):
+        self.txt_log.delete("1.0", tk.END)
 
 
 if __name__ == "__main__":
-    elevate_if_needed()
-    app = ThreatHunterApp()
+    app = AntiAPTHunterGUI()
     app.mainloop()

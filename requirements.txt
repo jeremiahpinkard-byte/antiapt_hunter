@@ -1,2 +1,5 @@
-yara-python>=4.3.0
+psutil>=5.9.0
 pywin32>=306
+
+# Optional (Requires Visual C++ Build Tools or Python <= 3.12 for pre-built wheels):
+# yara-python>=4.3.0
