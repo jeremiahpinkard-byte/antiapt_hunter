@@ -1,0 +1,11 @@
+{
+  "hashes": [],
+  "paths": [
+    "C:\\Windows\\System32\\",
+    "C:\\Program Files\\"
+  ],
+  "process_names": [
+    "explorer.exe",
+    "svchost.exe"
+  ]
+}
